@@ -1,3 +1,6 @@
+# Language config (personal — copy config.example.py to get started)
+config.py
+
 # Virtual environment
 .venv/
 __pycache__/

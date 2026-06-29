@@ -30,8 +30,12 @@ from pathlib import Path
 from pipeline import (
     ANKI_MODEL_NAME,
     AUDIO_DIR,
+    AUDIO_FIELD,
+    ENGLISH_FIELD,
     GCP_PROJECT,
     IMAGE_DIR,
+    IMAGE_FIELD,
+    TARGET_FIELD,
     ankiconnect_request,
     craft_image_prompt,
     generate_image,
@@ -78,17 +82,18 @@ def enrich_note(note: dict) -> bool:
     nid = note["noteId"]
     fields = note["fields"]
 
-    korean_raw  = fields.get("Korean", {}).get("value", "")
-    english_raw = fields.get("English", {}).get("value", "")
-    korean  = clean_field(korean_raw)
+    target_raw  = fields.get(TARGET_FIELD, {}).get("value", "")
+    english_raw = fields.get(ENGLISH_FIELD, {}).get("value", "")
+    target  = clean_field(target_raw)
     english = clean_field(english_raw)
 
-    if not korean or not english:
-        print(f"  [SKIP] note {nid}: missing Korean or English (Korean={korean!r}, English={english!r})")
+    if not target or not english:
+        print(f"  [SKIP] note {nid}: missing {TARGET_FIELD} or {ENGLISH_FIELD} "
+              f"({TARGET_FIELD}={target!r}, {ENGLISH_FIELD}={english!r})")
         return False
 
-    has_audio = bool(clean_field(fields.get("KoreanPronunciation", {}).get("value", "")))
-    has_image = bool(clean_field(fields.get("NormalImage", {}).get("value", "")))
+    has_audio = bool(clean_field(fields.get(AUDIO_FIELD, {}).get("value", "")))
+    has_image = bool(clean_field(fields.get(IMAGE_FIELD, {}).get("value", "")))
 
     audio_path = AUDIO_DIR / f"note_{nid}.mp3"
     image_path = IMAGE_DIR / f"note_{nid}.jpg"
@@ -97,19 +102,19 @@ def enrich_note(note: dict) -> bool:
     fields_to_update: dict[str, str] = {}
 
     if has_audio:
-        print(f"  [TTS]  note {nid}: KoreanPronunciation already filled, skipping")
+        print(f"  [TTS]  note {nid}: {AUDIO_FIELD} already filled, skipping")
     else:
         if not audio_path.exists():
-            generate_tts(korean, audio_path)
+            generate_tts(target, audio_path)
             api_called = True
-            print(f"  [TTS]  note {nid} '{korean}' → {audio_path}")
+            print(f"  [TTS]  note {nid} '{target}' → {audio_path}")
         else:
             print(f"  [TTS]  note {nid}: file exists, reusing {audio_path}")
         upload_media(audio_path)
-        fields_to_update["KoreanPronunciation"] = f"[sound:{audio_path.name}]"
+        fields_to_update[AUDIO_FIELD] = f"[sound:{audio_path.name}]"
 
     if has_image:
-        print(f"  [IMG]  note {nid}: NormalImage already filled, skipping")
+        print(f"  [IMG]  note {nid}: {IMAGE_FIELD} already filled, skipping")
     else:
         if not image_path.exists():
             prompt = craft_image_prompt(english)
@@ -120,7 +125,7 @@ def enrich_note(note: dict) -> bool:
         else:
             print(f"  [IMG]  note {nid}: file exists, reusing {image_path}")
         upload_media(image_path)
-        fields_to_update["NormalImage"] = f'<img src="{image_path.name}">'
+        fields_to_update[IMAGE_FIELD] = f'<img src="{image_path.name}">'
 
     if fields_to_update:
         ankiconnect_request("updateNoteFields", note={
@@ -179,8 +184,8 @@ def main() -> None:
         print("\nDry run — these notes would be processed:")
         for n in notes:
             nid = n["noteId"]
-            kor = clean_field(n["fields"].get("Korean", {}).get("value", ""))
-            eng = clean_field(n["fields"].get("English", {}).get("value", ""))
+            kor = clean_field(n["fields"].get(TARGET_FIELD, {}).get("value", ""))
+            eng = clean_field(n["fields"].get(ENGLISH_FIELD, {}).get("value", ""))
             print(f"  - note {nid}: {kor}  ({eng})")
         return
 

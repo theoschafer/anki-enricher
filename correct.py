@@ -40,10 +40,15 @@ from pathlib import Path
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
+import config as _config
+
 from pipeline import (
     ANKI_MODEL_NAME,
+    AUDIO_FIELD,
+    ENGLISH_FIELD,
     GCP_PROJECT,
     GCP_REGION,
+    TARGET_FIELD,
     _call_with_timeout,
     ankiconnect_request,
     sync_anki,
@@ -68,47 +73,26 @@ COST_CAP_USD       = 4.0   # abort if running cost projected to exceed this
 
 CSV_FIELDS = [
     "noteId",
-    "original_korean",
+    "original_target",
     "original_english",
-    "korean_fixed",
+    "target_fixed",
     "english_fixed",
-    "korean_changed",
+    "target_changed",
     "english_changed",
     "reason",
 ]
 
-PROMPT_TEMPLATE = (
-    'You are a Korean language expert reviewing flashcards. Given a Korean '
-    'word or expression and its English meaning, decide:\n'
-    '  1. Is the Korean spelled correctly? (Real typos only: wrong jamo, '
-    'wrong batchim, missing/extra character. Do NOT change valid alternative '
-    'spellings, regional variants, or romanizations.)\n'
-    '  2. Does the English match the Korean\'s meaning? (Accept any valid '
-    'translation. Mark as mismatch ONLY if the English clearly does not '
-    'correspond to the Korean.)\n'
-    '\n'
-    'Return STRICT JSON, no markdown, no commentary, with these keys:\n'
-    '  {"korean_ok": bool, "korean_fixed": string|null, '
-    '"english_ok": bool, "english_fixed": string|null, '
-    '"reason": string}\n'
-    '\n'
-    'Rules for the fixed values:\n'
-    '  - korean_fixed: the corrected Korean string, or null if korean_ok=true.\n'
-    '  - english_fixed: a short corrected English translation (no full '
-    'sentences, keep the style of the original), or null if english_ok=true.\n'
-    '  - reason: 1 short sentence explaining what (if anything) was wrong. '
-    'If both are fine, say "ok".\n'
-    '\n'
-    'Input:\n'
-    '  Korean:  __KOREAN__\n'
-    '  English: __ENGLISH__\n'
-)
+CORRECTION_PROMPT = _config.CORRECTION_PROMPT
 
 
-def _build_prompt(korean: str, english: str) -> str:
-    """Build the LLM prompt without using str.format (the template's JSON
-    examples contain literal '{' and '}' which would break .format)."""
-    return PROMPT_TEMPLATE.replace("__KOREAN__", korean).replace("__ENGLISH__", english)
+def _build_prompt(target: str, english: str) -> str:
+    """Substitute __TARGET__ and __ENGLISH__ placeholders in the correction prompt."""
+    if not CORRECTION_PROMPT:
+        raise RuntimeError(
+            "CORRECTION_PROMPT is None in config.py — "
+            "set it to a prompt string or skip correct.py."
+        )
+    return CORRECTION_PROMPT.replace("__TARGET__", target).replace("__ENGLISH__", english)
 
 
 # ---------------------------------------------------------------------------
@@ -175,14 +159,14 @@ def _strip_code_fences(text: str) -> str:
     return t.strip()
 
 
-def score_note(korean: str, english: str, max_retries: int = 3) -> tuple[dict, int, int]:
+def score_note(target: str, english: str, max_retries: int = 3) -> tuple[dict, int, int]:
     """Ask Gemini whether the note has a typo / mismatch.
 
     Returns (parsed_json, input_tokens, output_tokens). Token counts are taken
     from the response usage metadata when available, else 0.
     """
     model = _get_model()
-    prompt = _build_prompt(korean, english)
+    prompt = _build_prompt(target, english)
 
     last_err: Exception | None = None
     for attempt in range(1, max_retries + 1):
@@ -235,22 +219,22 @@ def find_candidate_notes(include_corrected: bool) -> list[dict]:
     return ankiconnect_request("notesInfo", notes=note_ids)
 
 
-def interpret_result(parsed: dict, korean: str, english: str) -> tuple[str, str, bool, bool]:
-    """Normalize the LLM response into (korean_fixed, english_fixed, korean_changed, english_changed)."""
-    korean_ok  = bool(parsed.get("korean_ok", True))
+def interpret_result(parsed: dict, target: str, english: str) -> tuple[str, str, bool, bool]:
+    """Normalize the LLM response into (target_fixed, english_fixed, target_changed, english_changed)."""
+    target_ok  = bool(parsed.get("target_ok", True))
     english_ok = bool(parsed.get("english_ok", True))
 
-    korean_fixed_raw  = parsed.get("korean_fixed")
+    target_fixed_raw  = parsed.get("target_fixed")
     english_fixed_raw = parsed.get("english_fixed")
 
-    korean_fixed  = (korean_fixed_raw  or "").strip()
+    target_fixed  = (target_fixed_raw  or "").strip()
     english_fixed = (english_fixed_raw or "").strip()
 
     # A change only counts if the LLM said NOT ok AND produced a different value.
-    korean_changed  = (not korean_ok)  and bool(korean_fixed)  and korean_fixed  != korean
+    target_changed  = (not target_ok)  and bool(target_fixed)  and target_fixed  != target
     english_changed = (not english_ok) and bool(english_fixed) and english_fixed != english
 
-    return korean_fixed, english_fixed, korean_changed, english_changed
+    return target_fixed, english_fixed, target_changed, english_changed
 
 
 def run_scan(args: argparse.Namespace) -> None:
@@ -281,22 +265,22 @@ def run_scan(args: argparse.Namespace) -> None:
     total_out_tok = 0
     scanned = 0
     proposed = 0
-    korean_fixes = 0
+    target_fixes = 0
     english_fixes = 0
     failed = 0
 
     for i, note in enumerate(notes):
         nid = note["noteId"]
         fields = note["fields"]
-        korean  = clean_field(fields.get("Korean", {}).get("value", ""))
-        english = clean_field(fields.get("English", {}).get("value", ""))
+        target  = clean_field(fields.get(TARGET_FIELD, {}).get("value", ""))
+        english = clean_field(fields.get(ENGLISH_FIELD, {}).get("value", ""))
 
-        if not korean or not english:
-            print(f"[{i+1}/{len(notes)}] note {nid}: SKIP — missing Korean or English")
+        if not target or not english:
+            print(f"[{i+1}/{len(notes)}] note {nid}: SKIP — missing {TARGET_FIELD} or {ENGLISH_FIELD}")
             continue
 
         try:
-            parsed, in_tok, out_tok = score_note(korean, english)
+            parsed, in_tok, out_tok = score_note(target, english)
         except Exception as exc:  # noqa: BLE001
             failed += 1
             print(f"[{i+1}/{len(notes)}] note {nid}: ERROR {exc}", file=sys.stderr)
@@ -307,35 +291,35 @@ def run_scan(args: argparse.Namespace) -> None:
         total_out_tok += out_tok
         scanned += 1
 
-        k_fixed, e_fixed, k_changed, e_changed = interpret_result(parsed, korean, english)
+        t_fixed, e_fixed, t_changed, e_changed = interpret_result(parsed, target, english)
         reason = str(parsed.get("reason", "")).strip()
 
         tag = []
-        if k_changed:
-            tag.append("KOR")
-            korean_fixes += 1
+        if t_changed:
+            tag.append("TGT")
+            target_fixes += 1
         if e_changed:
             tag.append("ENG")
             english_fixes += 1
         tag_str = "+".join(tag) if tag else "ok"
 
         prefix = f"[{i+1}/{len(notes)}] note {nid} [{tag_str}]"
-        if k_changed or e_changed:
+        if t_changed or e_changed:
             proposed += 1
             change_bits = []
-            if k_changed:
-                change_bits.append(f"KOR '{korean}' → '{k_fixed}'")
+            if t_changed:
+                change_bits.append(f"TGT '{target}' → '{t_fixed}'")
             if e_changed:
                 change_bits.append(f"ENG '{english}' → '{e_fixed}'")
             print(f"{prefix}  {'; '.join(change_bits)}  ({reason})")
             if not args.dry_run:
                 append_correction_row({
                     "noteId":           nid,
-                    "original_korean":  korean,
+                    "original_target":  target,
                     "original_english": english,
-                    "korean_fixed":     k_fixed if k_changed else "",
+                    "target_fixed":     t_fixed if t_changed else "",
                     "english_fixed":    e_fixed if e_changed else "",
-                    "korean_changed":   "1" if k_changed else "0",
+                    "target_changed":   "1" if t_changed else "0",
                     "english_changed":  "1" if e_changed else "0",
                     "reason":           reason,
                 })
@@ -360,7 +344,7 @@ def run_scan(args: argparse.Namespace) -> None:
     cost = estimated_cost(total_in_tok, total_out_tok)
     print(
         f"\nScan complete. Scanned {scanned}, proposed {proposed} correction(s) "
-        f"({korean_fixes} Korean, {english_fixes} English), failed {failed}. "
+        f"({target_fixes} target, {english_fixes} English), failed {failed}. "
         f"Tokens: {total_in_tok} in / {total_out_tok} out  ≈ ${cost:.3f}."
     )
     if not args.dry_run and proposed > 0:
@@ -424,16 +408,16 @@ def run_apply(args: argparse.Namespace) -> None:
             print(f"[{i+1}/{len(rows)}] bad row, skipping: {exc}", file=sys.stderr)
             continue
 
-        k_changed = row.get("korean_changed") == "1"
+        k_changed = row.get("target_changed") == "1"
         e_changed = row.get("english_changed") == "1"
 
         fields_to_update: dict[str, str] = {}
         if k_changed:
-            fields_to_update["Korean"] = row["korean_fixed"]
+            fields_to_update[TARGET_FIELD] = row["target_fixed"]
             # Audio now stale — clear it so enrich.py regenerates
-            fields_to_update["KoreanPronunciation"] = ""
+            fields_to_update[AUDIO_FIELD] = ""
         if e_changed:
-            fields_to_update["English"] = row["english_fixed"]
+            fields_to_update[ENGLISH_FIELD] = row["english_fixed"]
 
         print(f"[{i+1}/{len(rows)}] note {nid}: updating "
               f"{list(fields_to_update.keys())}")
@@ -464,8 +448,8 @@ def run_apply(args: argparse.Namespace) -> None:
         print("\nDon't forget to sync your phone's Anki app to pull the changes.")
 
     if korean_updated > 0:
-        print(f"\n{korean_updated} note(s) had their Korean fixed — their "
-              f"KoreanPronunciation was cleared and the '{ENRICH_TAG}' tag was "
+        print(f"\n{korean_updated} note(s) had their {TARGET_FIELD} fixed — their "
+              f"{AUDIO_FIELD} was cleared and the '{ENRICH_TAG}' tag was "
               f"re-added.\nRun  python enrich.py  to regenerate the audio.")
 
 
@@ -474,7 +458,7 @@ def run_apply(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="LLM-powered Korean/English correction for Anki notes")
+    p = argparse.ArgumentParser(description="LLM-powered correction pass for Anki notes")
     p.add_argument("--limit", type=int, default=None,
                    help="Process only the first N matching notes (good for a smoke test)")
     p.add_argument("--apply", action="store_true",
@@ -493,8 +477,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    if GCP_PROJECT == "your-project-id":
-        print("ERROR: Set GCP_PROJECT in pipeline.py before running.", file=sys.stderr)
+    if not CORRECTION_PROMPT:
+        print("ERROR: CORRECTION_PROMPT is None in config.py — set a prompt or skip correct.py.",
+              file=sys.stderr)
         sys.exit(1)
 
     if args.apply:

@@ -1,17 +1,19 @@
 """
-Korean Anki Note Generation Pipeline
-=====================================
-Reads korean_vocab_cleaned.csv and for each word:
-  1. Generates a Korean TTS mp3 (Google Cloud TTS)
+Anki Note Generation Pipeline
+==============================
+Reads <language>_vocab_cleaned.csv and for each word:
+  1. Generates TTS audio (Google Cloud Text-to-Speech)
   2. Asks Gemini to craft an image prompt, then generates an image (Imagen 3)
   3. Exports inspection.csv
-  4. Builds korean_anki.apkg ready to import into Anki
+  4. Builds <language>_anki.apkg ready to import into Anki
 
 Usage:
     python pipeline.py                  # full run (sample pause after word 5)
     python pipeline.py --sample-only    # generate first 5 words only, no .apkg
     python pipeline.py --apkg-only      # skip generation, rebuild .apkg from existing files
     python pipeline.py --limit 20       # process only the first N words
+
+Language / Anki settings live in config.py — copy config.example.py to get started.
 """
 
 import argparse
@@ -33,39 +35,59 @@ import vertexai
 from vertexai.generative_models import GenerativeModel
 
 # ---------------------------------------------------------------------------
-# Configuration — edit these before running
+# Load language config
 # ---------------------------------------------------------------------------
-GCP_PROJECT = "korean-anki-495023"   # ← set your Google Cloud project ID
-GCP_REGION  = "us-central1"       # Imagen 3 is available in us-central1
+try:
+    import config
+except ImportError:
+    sys.exit(
+        "ERROR: config.py not found.\n"
+        "Copy config.example.py to config.py and fill in your settings."
+    )
 
-TTS_VOICE   = "ko-KR-Chirp3-HD-Achernar"
-TTS_LANG    = "ko-KR"
+# Re-export so enrich.py / correct.py can `from pipeline import …` as before.
+GCP_PROJECT     = config.GCP_PROJECT
+GCP_REGION      = config.GCP_REGION
+TTS_LANG        = config.TTS_LANG
+TTS_VOICE       = config.TTS_VOICE
+ANKI_MODEL_NAME = config.ANKI_MODEL_NAME
+ANKI_MODEL_ID   = config.ANKI_MODEL_ID
+TARGET_FIELD    = config.TARGET_FIELD
+AUDIO_FIELD     = config.AUDIO_FIELD
+ENGLISH_FIELD   = config.ENGLISH_FIELD
+IMAGE_FIELD     = config.IMAGE_FIELD
+TARGET_COLUMN   = config.TARGET_COLUMN
 
-INPUT_CSV   = Path("korean_vocab_cleaned.csv")
+# ---------------------------------------------------------------------------
+# Paths (derived from language name so they're easy to find)
+# ---------------------------------------------------------------------------
+INPUT_CSV   = Path(f"{config.LANGUAGE}_vocab_cleaned.csv")
 AUDIO_DIR   = Path("audio")
 IMAGE_DIR   = Path("images")
 OUTPUT_CSV  = Path("inspection.csv")
-OUTPUT_APKG = Path("korean_anki.apkg")
+OUTPUT_APKG = Path(f"{config.LANGUAGE}_anki.apkg")
 
-SAMPLE_SIZE = 5   # number of words to generate before pausing for review
-
-# Existing "theo-korean-advanced" note type in your Anki collection
-ANKI_MODEL_NAME = "theo-korean-advanced"
-ANKI_MODEL_ID = 1_777_663_904_019
-ANKI_DECK_ID_BASE = 1_234_567_890   # deck IDs are derived from this + deck name hash
+SAMPLE_SIZE = 5   # words to generate before the interactive review pause
 
 # AnkiConnect endpoint
 ANKICONNECT_URL = "http://localhost:8765"
 
 # ---------------------------------------------------------------------------
-# Gemini image-prompt template
+# Gemini image-prompt template (language-agnostic — works from English gloss)
 # ---------------------------------------------------------------------------
 PROMPT_TEMPLATE = (
-    'Your job is to create a prompt, that will be given to an image generation model. Given the vocabulary word or expression "{word}", Come up with a vivid, concrete visual scene '
-    "that illustrates this concept. When in doubt about the meaning of the word of expression, use the most common meaning of the word. Output only the image generation prompt, max 60 words"
-    'Avoid mentioning children in the output prompt. If you think the presence of children is essential to illustrate the concept properly, add the instruction to make the image in a cartoon style.'
-    "Example, given the expression -How many times-, a correct output would be “A close-up of a wall covered in tally marks being counted by a hand, representing repeated occurrences, minimal background, clear and symbolic, easy to understand”"
-    "Example, given the expression -hesitate-, a correct output would be “A realistic image of a person frozen mid-step at a crosswalk while the world around them moves in motion blur, representing hesitation, anxious expression, easy to understand”"
+    'Your job is to create a prompt, that will be given to an image generation model. '
+    'Given the vocabulary word or expression "{word}", come up with a vivid, concrete visual scene '
+    'that illustrates this concept. When in doubt about the meaning of the word or expression, '
+    'use the most common meaning. Output only the image generation prompt, max 60 words. '
+    'Avoid mentioning children. If children are essential to illustrate the concept, '
+    'add an instruction to use cartoon style. '
+    'Example — given "How many times": '
+    '"A close-up of a wall covered in tally marks being counted by a hand, '
+    'representing repeated occurrences, minimal background, clear and symbolic." '
+    'Example — given "hesitate": '
+    '"A realistic image of a person frozen mid-step at a crosswalk while the world '
+    'around them moves in motion blur, representing hesitation, anxious expression."'
 )
 
 # ---------------------------------------------------------------------------
@@ -79,10 +101,10 @@ def word_id(idx: int) -> str:
 def load_vocab(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df.columns = df.columns.str.strip()
-    df["English"] = df["English"].str.strip()
-    df["Korean"]  = df["Korean"].str.strip()
-    df["deck"]    = df["deck"].str.strip()
-    df["id"]      = [word_id(i + 1) for i in range(len(df))]
+    df[ENGLISH_FIELD]  = df[ENGLISH_FIELD].str.strip()
+    df[TARGET_COLUMN]  = df[TARGET_COLUMN].str.strip()
+    df["deck"]         = df["deck"].str.strip()
+    df["id"]           = [word_id(i + 1) for i in range(len(df))]
     return df
 
 
@@ -90,11 +112,11 @@ def load_vocab(path: Path) -> pd.DataFrame:
 # TTS
 # ---------------------------------------------------------------------------
 
-def generate_tts(korean_text: str, out_path: Path) -> None:
+def generate_tts(text: str, out_path: Path) -> None:
     from google.cloud import texttospeech
 
     client = texttospeech.TextToSpeechClient()
-    synthesis_input = texttospeech.SynthesisInput(text=korean_text)
+    synthesis_input = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(
         language_code=TTS_LANG,
         name=TTS_VOICE,
@@ -231,11 +253,11 @@ def generate_image(prompt: str, out_path: Path, max_retries: int = 5) -> None:
 # ---------------------------------------------------------------------------
 
 def process_word(row: pd.Series, audio_dir: Path, image_dir: Path) -> dict:
-    wid      = row["id"]
-    korean   = row["Korean"]
-    english  = row["English"]
-    deck     = row["deck"]
-    tags     = row.get("tags", "")
+    wid     = row["id"]
+    target  = row[TARGET_COLUMN]
+    english = row[ENGLISH_FIELD]
+    deck    = row["deck"]
+    tags    = row.get("tags", "")
 
     audio_path = audio_dir / f"{wid}.mp3"
     image_path = image_dir / f"{wid}.jpg"
@@ -248,7 +270,7 @@ def process_word(row: pd.Series, audio_dir: Path, image_dir: Path) -> dict:
         audio_ok = True
     else:
         try:
-            generate_tts(korean, audio_path)
+            generate_tts(target, audio_path)
             audio_ok = True
             audio_generated = True
             print(f"    [TTS]   {wid} → {audio_path}")
@@ -285,8 +307,8 @@ def process_word(row: pd.Series, audio_dir: Path, image_dir: Path) -> dict:
     return {
         "id":           wid,
         "deck":         deck,
-        "English":      english,
-        "Korean":       korean,
+        ENGLISH_FIELD:  english,
+        TARGET_COLUMN:  target,
         "tags":         tags,
         "audio_file":   str(audio_path) if audio_ok else "",
         "image_file":   str(image_path) if image_ok else "",
@@ -300,7 +322,8 @@ def process_word(row: pd.Series, audio_dir: Path, image_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def write_inspection_csv(records: list[dict], path: Path) -> None:
-    fieldnames = ["id", "deck", "English", "Korean", "tags", "audio_file", "image_file", "image_prompt"]
+    fieldnames = ["id", "deck", ENGLISH_FIELD, TARGET_COLUMN, "tags",
+                  "audio_file", "image_file", "image_prompt"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -312,46 +335,57 @@ def write_inspection_csv(records: list[dict], path: Path) -> None:
 # Anki .apkg generation
 # ---------------------------------------------------------------------------
 
+ANKI_DECK_ID_BASE = 1_234_567_890   # deck IDs are derived from this + deck name hash
+
+
 def deck_id_from_name(name: str) -> int:
     """Derive a stable integer deck ID from the deck name string."""
     return ANKI_DECK_ID_BASE + hash(name) % (1 << 28)
 
 
+def _anki_ref(field: str) -> str:
+    """Anki template reference: {{FieldName}}"""
+    return "{{" + field + "}}"
+
+
+def _anki_cond(field: str, content: str) -> str:
+    """Anki conditional block: {{#Field}}content{{/Field}}"""
+    return "{{#" + field + "}}" + content + "{{/" + field + "}}"
+
+
 def build_apkg(records: list[dict], out_path: Path) -> None:
-    # Note type — field order must match theo-advanced-korean exactly
     model = genanki.Model(
         ANKI_MODEL_ID,
-        "theo-korean-advanced",
+        ANKI_MODEL_NAME,
         fields=[
-            {"name": "English"},
-            {"name": "Korean"},
-            {"name": "KoreanPronunciation"},
-            {"name": "NormalImage"},
-            {"name": "MnemonicImage"},
+            {"name": ENGLISH_FIELD},
+            {"name": TARGET_FIELD},
+            {"name": AUDIO_FIELD},
+            {"name": IMAGE_FIELD},
         ],
         templates=[
             {
-                "name": "Korean → English",
+                "name": f"{TARGET_FIELD} → {ENGLISH_FIELD}",
                 "qfmt": (
-                    "{{Korean}}<br>"
-                    "{{#KoreanPronunciation}}[sound:{{KoreanPronunciation}}]{{/KoreanPronunciation}}"
+                    _anki_ref(TARGET_FIELD) + "<br>"
+                    + _anki_cond(AUDIO_FIELD, f"[sound:{_anki_ref(AUDIO_FIELD)}]")
                 ),
                 "afmt": (
                     "{{FrontSide}}<hr id=answer>"
-                    "{{English}}<br>"
-                    "{{#NormalImage}}<img src='{{NormalImage}}'>{{/NormalImage}}"
+                    + _anki_ref(ENGLISH_FIELD) + "<br>"
+                    + _anki_cond(IMAGE_FIELD, f"<img src='{_anki_ref(IMAGE_FIELD)}'>")
                 ),
             },
             {
-                "name": "English → Korean",
+                "name": f"{ENGLISH_FIELD} → {TARGET_FIELD}",
                 "qfmt": (
-                    "{{English}}<br>"
-                    "{{#NormalImage}}<img src='{{NormalImage}}'>{{/NormalImage}}"
+                    _anki_ref(ENGLISH_FIELD) + "<br>"
+                    + _anki_cond(IMAGE_FIELD, f"<img src='{_anki_ref(IMAGE_FIELD)}'>")
                 ),
                 "afmt": (
                     "{{FrontSide}}<hr id=answer>"
-                    "{{Korean}}<br>"
-                    "{{#KoreanPronunciation}}[sound:{{KoreanPronunciation}}]{{/KoreanPronunciation}}"
+                    + _anki_ref(TARGET_FIELD) + "<br>"
+                    + _anki_cond(AUDIO_FIELD, f"[sound:{_anki_ref(AUDIO_FIELD)}]")
                 ),
             },
         ],
@@ -380,19 +414,17 @@ def build_apkg(records: list[dict], out_path: Path) -> None:
             image_ref = Path(rec["image_file"]).name
             media_files.append(rec["image_file"])
 
-        # Wrap with Anki special markup so the existing templates (which
-        # render {{KoreanPronunciation}} and {{NormalImage}} directly) work.
+        # Wrap with Anki special markup so the existing templates render correctly.
         sound_field = f"[sound:{audio_ref}]" if audio_ref else ""
         image_field = f'<img src="{image_ref}">' if image_ref else ""
 
         note = genanki.Note(
             model=model,
             fields=[
-                rec["English"],
-                rec["Korean"],
+                rec[ENGLISH_FIELD],
+                rec[TARGET_COLUMN],
                 sound_field,
                 image_field,
-                "",          # MnemonicImage — intentionally empty
             ],
             tags=rec["tags"].split() if rec.get("tags") else [],
             guid=genanki.guid_for(rec["id"]),  # stable GUID based on our unique ID
@@ -449,11 +481,10 @@ def push_via_ankiconnect(records: list[dict]) -> None:
             f"Available models: {list(models.keys())}"
         )
     fields = ankiconnect_request("modelFieldNames", modelName=ANKI_MODEL_NAME)
-    expected = ["English", "Korean", "KoreanPronunciation", "NormalImage", "MnemonicImage"]
-    for f in expected:
-        if f not in fields:
+    for expected_field in (ENGLISH_FIELD, TARGET_FIELD, AUDIO_FIELD, IMAGE_FIELD):
+        if expected_field not in fields:
             raise RuntimeError(
-                f"Note type '{ANKI_MODEL_NAME}' is missing field '{f}'. "
+                f"Note type '{ANKI_MODEL_NAME}' is missing field '{expected_field}'. "
                 f"Found fields: {fields}"
             )
 
@@ -479,8 +510,7 @@ def push_via_ankiconnect(records: list[dict]) -> None:
             uploaded += 1
     print(f"[ANKI] Uploaded {uploaded} media files")
 
-    # 4. Add notes (one by one — AnkiConnect supports addNotes for batching but
-    #    addNote gives clearer per-row errors)
+    # 4. Add notes
     added, skipped, failed = 0, 0, 0
     for rec in records:
         audio_ref = Path(rec["audio_file"]).name if rec.get("audio_file") else ""
@@ -492,11 +522,10 @@ def push_via_ankiconnect(records: list[dict]) -> None:
             "deckName": rec["deck"],
             "modelName": ANKI_MODEL_NAME,
             "fields": {
-                "English":             rec["English"],
-                "Korean":              rec["Korean"],
-                "KoreanPronunciation": sound_field,
-                "NormalImage":         image_field,
-                "MnemonicImage":       "",
+                ENGLISH_FIELD: rec[ENGLISH_FIELD],
+                TARGET_FIELD:  rec[TARGET_COLUMN],
+                AUDIO_FIELD:   sound_field,
+                IMAGE_FIELD:   image_field,
             },
             "tags": rec["tags"].split() if rec.get("tags") else [],
             "options": {
@@ -513,7 +542,7 @@ def push_via_ankiconnect(records: list[dict]) -> None:
                 skipped += 1
             else:
                 failed += 1
-                print(f"  [ANKI] FAIL {rec['id']} ({rec['English']}): {err}")
+                print(f"  [ANKI] FAIL {rec['id']} ({rec[ENGLISH_FIELD]}): {err}")
 
     print(f"[ANKI] Added {added}, skipped {skipped} (duplicates), failed {failed}")
 
@@ -523,7 +552,7 @@ def push_via_ankiconnect(records: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Korean Anki pipeline")
+    p = argparse.ArgumentParser(description="Anki enrichment pipeline")
     p.add_argument("--sample", type=int, nargs="?", const=SAMPLE_SIZE, default=None,
                    metavar="N",
                    help="Generate/push the first N words only (no interactive pause). "
@@ -547,14 +576,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    # Validate config
-    if not args.apkg_only and GCP_PROJECT == "your-project-id":
-        print("ERROR: Set GCP_PROJECT at the top of pipeline.py before running.", file=sys.stderr)
-        sys.exit(1)
-
-    # Set up Google credentials via Application Default Credentials
-    # (run `gcloud auth application-default login` beforehand)
 
     AUDIO_DIR.mkdir(exist_ok=True)
     IMAGE_DIR.mkdir(exist_ok=True)
@@ -614,7 +635,7 @@ def main() -> None:
             print(f"PHASE 2: Processing all {total} words")
             print(f"{'='*60}")
 
-        print(f"[{i+1}/{total}] {row['id']}  {row['Korean']}  ({row['English']})")
+        print(f"[{i+1}/{total}] {row['id']}  {row[TARGET_COLUMN]}  ({row[ENGLISH_FIELD]})")
         rec = process_word(row, AUDIO_DIR, IMAGE_DIR)
         records.append(rec)
 
@@ -648,7 +669,7 @@ def main() -> None:
     else:
         print(f"PHASE {phase}: Building .apkg")
         print(f"{'='*60}")
-        apkg_path = OUTPUT_APKG.with_name("korean_anki_sample.apkg") if sample_mode else OUTPUT_APKG
+        apkg_path = OUTPUT_APKG.with_name(f"{config.LANGUAGE}_anki_sample.apkg") if sample_mode else OUTPUT_APKG
         build_apkg(records, apkg_path)
         if sample_mode:
             print(f"\nSample run complete ({args.sample} word(s)). Test import: open Anki and import {apkg_path}")
