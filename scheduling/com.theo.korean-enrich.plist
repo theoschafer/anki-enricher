@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.theo.korean-enrich</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/theo/Projects/korean_auto/scheduling/run_enrich.sh</string>
+    </array>
+
+    <!-- Run every day at 11:00 local time. launchd uses the Mac's system
+         timezone, so as long as the Mac is set to Pacific time this is
+         11am PST in winter / 11am PDT in summer. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>11</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Don't run immediately when the agent is loaded; only on schedule. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd's own stdout/stderr (separate from our wrapper's enrich.log). -->
+    <key>StandardOutPath</key>
+    <string>/Users/theo/Projects/korean_auto/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/theo/Projects/korean_auto/logs/launchd.err.log</string>
+</dict>
+</plist>

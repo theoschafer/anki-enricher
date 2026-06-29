@@ -1,0 +1,4 @@
+google-cloud-texttospeech==2.36.0
+vertexai==1.71.1
+genanki==0.13.1
+pandas==2.3.3

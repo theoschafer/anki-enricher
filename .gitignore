@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated media (audio + images) — large binary files
+audio/
+images/
+
+# Anki package files — can be 1GB+
+*.apkg
+
+# Personal vocabulary data — not committed (add your own)
+korean_vocab_cleaned.csv
+korean_vocab.txt
+
+# Pipeline output / audit files — generated locally
+inspection.csv
+corrections.csv
+
+# Logs
+logs/*.log
+
+# macOS
+.DS_Store
